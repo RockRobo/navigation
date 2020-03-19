@@ -77,6 +77,8 @@
 // For monitoring the estimator
 #include <diagnostic_updater/diagnostic_updater.h>
 
+#include <atomic>
+
 #define NEW_UNIFORM_SAMPLING 1
 
 using namespace amcl;
@@ -123,12 +125,11 @@ static double range_max_x;
 static double range_min_y;
 static double range_max_y;
 
-typedef std::vector<std::pair<float, float>> rr_laser_t;
 typedef struct
 {
     int x, y;
     float theta;
-    float score;
+    int score;
 } rr_relocate_node_t;
 
 /* This function is only useful to have the whole code work
@@ -308,11 +309,12 @@ class AmclNode
 
     std::vector<float> rr_laser_scan;
     int rr_laser_count;
-    float rr_laser_min_angle, rr_laser_increment_angle, rr_laser_max_range;
-    std::vector<std::pair<float, float>> rr_prob_score;
-    float calcuThreshold(const rr_laser_t& scan, float avg);
-    float calcuScore(const rr_laser_t& scan, rr_relocate_node_t& pose, float avg, std::vector<float>& offset_x, std::vector<float>& offset_y);
+    float rr_laser_min_angle, rr_laser_increment_angle, rr_laser_max_range, rr_angle_resolution;
+    std::vector<float> rr_sin_x;
+    int calcuScore(std::vector<float>& x, std::vector<float>& y);
     bool isMapObs(int x, int y);
+    float calcusin(float& theta);
+    float calcucos(float& theta);
 };
 
 std::vector<std::pair<int,int> > AmclNode::free_space_indices;
@@ -377,8 +379,11 @@ AmclNode::AmclNode() :
   rr_laser_min_angle = 0.0;
   rr_laser_max_range = 0.0;
   rr_laser_increment_angle = 0.0;
-  for (auto i = 0; i < 5; i++) {
-    rr_prob_score.push_back(std::make_pair(0.4 * i, 0.6 + 0.2 * i));
+  rr_angle_resolution = static_cast<float>(0.25 * M_PIf32 / 180.0);
+  float x = 0.0;
+  while (x <= M_PIf32 / 2.0) {
+    rr_sin_x.emplace_back(sinf(x));
+    x += rr_angle_resolution;
   }
 
   // Grab params off the param server
@@ -1161,61 +1166,69 @@ AmclNode::rangeLocalizationCallback(amcl::RectPara::Request& req,
 //                (void *)map_);
 //  ROS_INFO("Global range initialisation done!");
 
-  int cell_min_x = MAP_GXWX(map_, range_min_x);
-  int cell_max_x = MAP_GXWX(map_, range_max_x);
-  int cell_min_y = MAP_GYWY(map_, range_min_y);
-  int cell_max_y = MAP_GYWY(map_, range_max_y);
+  auto cell_min_x = static_cast<int>(MAP_GXWX(map_, range_min_x));
+  auto cell_max_x = static_cast<int>(MAP_GXWX(map_, range_max_x));
+  auto cell_min_y = static_cast<int>(MAP_GYWY(map_, range_min_y));
+  auto cell_max_y = static_cast<int>(MAP_GYWY(map_, range_max_y));
 
   auto start_time = ros::Time::now();
+
   bool updated = false;
-  rr_laser_t single_laser;
-  float single_laser_avg_dist = 0.0;
+  int point_size = 0;
+  std::vector<float> offset_x, offset_y;
   for (auto i = 0; i < rr_laser_count; i++) {
     if (rr_laser_scan[i] < rr_laser_max_range) {
-      single_laser.push_back(std::make_pair(rr_laser_scan[i], rr_laser_min_angle + rr_laser_increment_angle * i));
-      single_laser_avg_dist += rr_laser_scan[i];
+      point_size++;
+      auto temp_angle = rr_laser_min_angle + rr_laser_increment_angle * i;
+      offset_x.emplace_back(rr_laser_scan[i] * calcucos(temp_angle));
+      offset_y.emplace_back(rr_laser_scan[i] * calcusin(temp_angle));
     }
   }
-  single_laser_avg_dist /= single_laser.size();
-  ROS_INFO("min angle: %.3f, inc angle: %.3f, valid count: %d/%d, avg dist: %.3f",
-           rr_laser_min_angle, rr_laser_increment_angle, single_laser.size(), rr_laser_count, single_laser_avg_dist);
+  ROS_WARN("min angle: %.3f, inc angle: %.3f, valid count(obs score): %d/%d",
+           rr_laser_min_angle, rr_laser_increment_angle, point_size, rr_laser_count);
 
-  // calculate sinB & cosB
-  std::vector<float> sin_b, cos_b;
-  for (auto& scan:single_laser) {
-    sin_b.push_back(sinf(scan.second));
-    cos_b.push_back(cosf(scan.second));
-  }
-
-  auto best_node = rr_relocate_node_t {};
-  auto threshold = calcuThreshold(single_laser, single_laser_avg_dist);
-  auto local_score = 0.0;
-
-//#pragma omp parallel for
+  auto best_node    = rr_relocate_node_t {0, 0, 0.0, static_cast<int>(point_size * 0.4)};
+  int local_score   = 0,
+      current_score = 0;
+  std::vector<float> offset_xn(point_size),
+                     offset_yn(point_size),
+                     laser_point_x(point_size),
+                     laser_point_y(point_size);
+  std::atomic_flag lock{0};
+#pragma omp parallel for
   for (auto th = -M_PIf32; th < M_PIf32;) {
-    // calculate sinA & cosA & C*sin(A+B) & C*cos(A+B)
-    auto sin_a = sinf(th);
-    auto cos_a = cosf(th);
-    std::vector<float> offset_x, offset_y;
-    for (auto i = 0; i < single_laser.size(); i++) {
-      offset_x.push_back(single_laser[i].first * (cos_a * cos_b[i] - sin_a * sin_b[i]));
-      offset_y.push_back(single_laser[i].first * (sin_a * cos_b[i] + cos_a * sin_b[i]));
+    auto sin_a = calcusin(th);
+    auto cos_a = calcucos(th);
+    for (auto i = 0; i < point_size; i++) {
+      offset_xn[i] = offset_x[i] * cos_a - offset_y[i] * sin_a;
+      offset_yn[i] = offset_x[i] * sin_a + offset_y[i] * cos_a;
     }
 
     for (auto x = cell_min_x; x <= cell_max_x; x += 2) {
+      for (auto i = 0; i < point_size; i++) {
+        laser_point_x[i] = offset_xn[i] + static_cast<float>(MAP_WXGX(map_, x));
+      }
+
       for (auto y = cell_min_y; y <= cell_max_y; y += 2) {
         if (!MAP_VALID(map_, x, y) || map_->cells[MAP_INDEX(map_, x, y)].occ_state != -1)
           continue;
 
-        auto pose = rr_relocate_node_t {x, y, th, 0};
-        pose.score = calcuScore(single_laser, pose, single_laser_avg_dist, offset_x, offset_y);
-        if (pose.score > threshold && pose.score > best_node.score) {
-          updated   = true;
-          best_node = pose;
+        for (auto i = 0; i < point_size; i++) {
+          laser_point_y[i] = offset_yn[i] + static_cast<float>(MAP_WYGY(map_, y));
         }
-        if (pose.score > local_score) {
-          local_score = pose.score;
+
+        current_score = calcuScore(laser_point_x, laser_point_y);
+        if (current_score > best_node.score) {
+          updated = true;
+          while (lock.test_and_set(std::memory_order_acquire));
+          best_node.x = x;
+          best_node.y = y;
+          best_node.theta = th;
+          best_node.score = current_score;
+          lock.clear(std::memory_order_release);
         }
+
+        if (current_score > local_score) local_score = current_score;
       }
     }
     th += 3 * (M_PIf32 / 180.0);
@@ -1233,7 +1246,7 @@ AmclNode::rangeLocalizationCallback(amcl::RectPara::Request& req,
 //    }
 //  }
 
-  ROS_WARN("best score is %.1f", local_score);
+  ROS_WARN("best score is %d", local_score);
   if (updated) {
     ROS_WARN("origin data, [%.3f, %.3f, %.3f]", MAP_WXGX(map_, best_node.x), MAP_WYGY(map_, best_node.y), best_node.theta);
     // best node reflect laser frame in map's pose, we need base frame in map's pose
@@ -1266,7 +1279,7 @@ AmclNode::rangeLocalizationCallback(amcl::RectPara::Request& req,
     pf_relocate_pose_mean.v[0] = tmp_tf_stamped.transform.translation.x;
     pf_relocate_pose_mean.v[1] = tmp_tf_stamped.transform.translation.y;
     pf_relocate_pose_mean.v[2] = tf2::getYaw(tmp_tf_stamped.transform.rotation);
-    ROS_WARN("Range relocate success! pose is [%.3f, %.3f, %.3f], score is %.1f",
+    ROS_WARN("Range relocate success! pose is [%.3f, %.3f, %.3f], score is %d",
              pf_relocate_pose_mean.v[0],
              pf_relocate_pose_mean.v[1],
              pf_relocate_pose_mean.v[2],
@@ -1835,63 +1848,90 @@ AmclNode::standardDeviationDiagnostics(diagnostic_updater::DiagnosticStatusWrapp
   }
 }
 
-float
-AmclNode::calcuThreshold(const rr_laser_t& scan, float avg)
+int
+AmclNode::calcuScore(std::vector<float>& x, std::vector<float>& y)
 {
-  float obs_score = 0.0;
-  for (auto s:scan) {
-    for (auto k = 0; k < 4; k++) {
-      if (s.first > rr_prob_score[k].first * avg && s.first <= rr_prob_score[k + 1].first * avg) {
-        obs_score += rr_prob_score[k].second;
-        break;
-      }
-      if (s.first > rr_prob_score[4].first * avg) {
-        obs_score += rr_prob_score[4].second;
-        break;
-      }
+  int score = 0;
+  for (auto i = 0; i < x.size(); i++) {
+    if (isMapObs(static_cast<int>(MAP_GXWX(map_, x[i])), static_cast<int>(MAP_GYWY(map_, y[i])))) {
+      score++;
     }
   }
-  ROS_WARN("obs_score is %.1f", obs_score);
-  // TODO: threshold can be modified
-  return static_cast<float>(obs_score * 0.5);
-}
 
-float
-AmclNode::calcuScore(const rr_laser_t& scan, rr_relocate_node_t& pose, float avg, std::vector<float>& offset_x, std::vector<float>& offset_y)
-{
-  float score    = 0.0;
-  auto origin_x = MAP_WXGX(map_, pose.x);
-  auto origin_y = MAP_WYGY(map_, pose.y);
-  for (auto i = 0; i < scan.size(); i++) {
-    auto x       = origin_x + offset_x[i];
-    auto y       = origin_y + offset_y[i];
-    int  index_x = MAP_GXWX(map_, x);
-    int  index_y = MAP_GYWY(map_, y);
-    if (isMapObs(index_x, index_y)) {
-      for (auto k = 0; k < 4; k++) {
-        if (scan[i].first > rr_prob_score[k].first * avg && scan[i].first <= rr_prob_score[k + 1].first * avg) {
-          score += rr_prob_score[k].second;
-          break;
-        }
-        if (scan[i].first > rr_prob_score[4].first * avg) {
-          score += rr_prob_score[4].second;
-          break;
-        }
-      }
-    }
-  }
   return score;
 }
 
 bool
 AmclNode::isMapObs(int x, int y) {
-  auto range = 0;
+  if (MAP_VALID(map_, x, y) && map_->cells[MAP_INDEX(map_, x, y)].occ_state == 1) return true;
+
+  int range = 0;
   for (int i = -range; i <= range; i++) {
     for (int j = -range; j <= range; j++) {
-      if (MAP_VALID(map_, x + i, y + j) && map_->cells[MAP_INDEX(map_, x + i, y + j)].occ_state == 1) {
-        return true;
-      }
+      if (i == 0 && j == 0) continue;
+      if (MAP_VALID(map_, x + i, y + j) && map_->cells[MAP_INDEX(map_, x + i, y + j)].occ_state == 1) return true;
     }
   }
+
   return false;
+}
+
+float
+AmclNode::calcusin(float& theta) {
+	if (rr_sin_x.empty())
+		return 0.0;
+
+	if (theta < -M_PIf32 || theta > M_PIf32) {
+		float multiplier = std::floor(theta / (2*M_PIf32));
+		theta = theta - multiplier*2*M_PIf32;
+		if (theta < -M_PIf32)
+			theta += 2*M_PIf32;
+		if (theta > M_PIf32)
+			theta -= 2*M_PIf32;
+	}
+
+	int idx = 0;
+	if (theta >= -M_PIf32 && theta < -M_PIf32 / 2.0) {
+		idx = static_cast<int>((theta + M_PIf32) / rr_angle_resolution);
+		return -rr_sin_x[idx];
+	} else if (theta >= -M_PIf32 / 2.0 && theta < 0.0) {
+		idx = static_cast<int>((-theta) / rr_angle_resolution);
+		return -rr_sin_x[idx];
+	} else if (theta >= 0.0 && theta < M_PIf32 / 2.0) {
+		idx = static_cast<int>((theta) / rr_angle_resolution);
+		return rr_sin_x[idx];
+	} else {
+		idx = static_cast<int>((-theta + M_PIf32) / rr_angle_resolution);
+		return rr_sin_x[idx];
+	}
+}
+
+float
+AmclNode::calcucos(float& theta) {
+	if (rr_sin_x.empty())
+		return 0.0;
+
+	if (theta < -M_PIf32 || theta > M_PIf32) {
+		float multiplier = std::floor(theta / (2*M_PIf32));
+		theta = theta - multiplier*2*M_PIf32;
+		if (theta < -M_PIf32)
+			theta += 2*M_PIf32;
+		if (theta > M_PIf32)
+			theta -= 2*M_PIf32;
+	}
+
+	int idx = 0;
+	if (theta >= -M_PIf32 && theta < -M_PIf32 / 2.0) {
+		idx = static_cast<int>((-theta - M_PIf32 / 2.0) / rr_angle_resolution);
+		return -rr_sin_x[idx];
+	} else if (theta >= -M_PIf32 / 2.0 && theta < 0.0) {
+		idx = static_cast<int>((theta + M_PIf32 / 2.0) / rr_angle_resolution);
+		return rr_sin_x[idx];
+	} else if (theta >= 0.0 && theta < M_PIf32 / 2.0) {
+		idx = static_cast<int>((-theta + M_PIf32 / 2.0) / rr_angle_resolution);
+		return rr_sin_x[idx];
+	} else {
+		idx = static_cast<int>((theta - M_PIf32 / 2.0) / rr_angle_resolution);
+		return -rr_sin_x[idx];
+	}
 }
