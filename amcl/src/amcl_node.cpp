@@ -380,11 +380,11 @@ AmclNode::AmclNode() :
   rr_laser_max_range = 0.0;
   rr_laser_increment_angle = 0.0;
   rr_angle_resolution = static_cast<float>(0.25 * M_PIf32 / 180.0);
-  float x = 0.0;
-  while (x <= M_PIf32 / 2.0) {
-    rr_sin_x.emplace_back(sinf(x));
-    x += rr_angle_resolution;
-  }
+//  float x = 0.0;
+//  while (x <= M_PIf32 / 2.0) {
+//    rr_sin_x.emplace_back(sinf(x));
+//    x += rr_angle_resolution;
+//  }
 
   // Grab params off the param server
   private_nh_.param("use_map_topic", use_map_topic_, false);
@@ -1180,8 +1180,8 @@ AmclNode::rangeLocalizationCallback(amcl::RectPara::Request& req,
     if (rr_laser_scan[i] < rr_laser_max_range) {
       point_size++;
       auto temp_angle = rr_laser_min_angle + rr_laser_increment_angle * i;
-      offset_x.emplace_back(rr_laser_scan[i] * calcucos(temp_angle));
-      offset_y.emplace_back(rr_laser_scan[i] * calcusin(temp_angle));
+      offset_x.emplace_back(rr_laser_scan[i] * cosf(temp_angle));
+      offset_y.emplace_back(rr_laser_scan[i] * sinf(temp_angle));
     }
   }
   ROS_WARN("min angle: %.3f, inc angle: %.3f, valid count(obs score): %d/%d",
@@ -1197,8 +1197,8 @@ AmclNode::rangeLocalizationCallback(amcl::RectPara::Request& req,
   std::atomic_flag lock{0};
 #pragma omp parallel for
   for (auto th = -M_PIf32; th < M_PIf32;) {
-    auto sin_a = calcusin(th);
-    auto cos_a = calcucos(th);
+    auto sin_a = sinf(th);
+    auto cos_a = cosf(th);
     for (auto i = 0; i < point_size; i++) {
       offset_xn[i] = offset_x[i] * cos_a - offset_y[i] * sin_a;
       offset_yn[i] = offset_x[i] * sin_a + offset_y[i] * cos_a;
