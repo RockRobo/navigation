@@ -310,6 +310,8 @@ class AmclNode
     std::vector<float> rr_laser_scan;
     int rr_laser_count;
     float rr_laser_min_angle, rr_laser_increment_angle, rr_laser_max_range, rr_angle_resolution;
+    int rr_serach_range_;
+    float rr_score_threshold_;
     std::vector<float> rr_sin_x;
     int calcuScore(std::vector<float>& x, std::vector<float>& y);
     bool isMapObs(int x, int y);
@@ -380,6 +382,8 @@ AmclNode::AmclNode() :
   rr_laser_max_range = 0.0;
   rr_laser_increment_angle = 0.0;
   rr_angle_resolution = static_cast<float>(0.25 * M_PIf32 / 180.0);
+  private_nh_.param<int>("search_range", rr_serach_range_, 0);
+  private_nh_.param<float>("score_threshold", rr_score_threshold_, 0.5);
 //  float x = 0.0;
 //  while (x <= M_PIf32 / 2.0) {
 //    rr_sin_x.emplace_back(sinf(x));
@@ -1161,7 +1165,8 @@ AmclNode::rangeLocalizationCallback(amcl::RectPara::Request& req,
     ROS_ERROR("Illegal rect!");
     return false;
   }
-  ROS_INFO("Start relocating, rect is [(%.3f, %.3f),(%.3f, %.3f)]", range_min_x, range_min_y, range_max_x, range_max_y);
+  ROS_INFO("Start relocating, rect is [(%.3f, %.3f),(%.3f, %.3f)], search range is %d, score threshold is %.2f",
+  		   range_min_x, range_min_y, range_max_x, range_max_y, rr_serach_range_, rr_score_threshold_);
 //  pf_init_model(pf_, (pf_init_model_fn_t)AmclNode::areaPoseGenerator,
 //                (void *)map_);
 //  ROS_INFO("Global range initialisation done!");
@@ -1187,7 +1192,7 @@ AmclNode::rangeLocalizationCallback(amcl::RectPara::Request& req,
   ROS_WARN("min angle: %.3f, inc angle: %.3f, valid count(obs score): %d/%d",
            rr_laser_min_angle, rr_laser_increment_angle, point_size, rr_laser_count);
 
-  auto best_node    = rr_relocate_node_t {0, 0, 0.0, static_cast<int>(point_size * 0.4)};
+  auto best_node    = rr_relocate_node_t {0, 0, 0.0, static_cast<int>(point_size * rr_score_threshold_)};
   int local_score   = 0,
       current_score = 0;
   std::vector<float> offset_xn(point_size),
@@ -1865,7 +1870,7 @@ bool
 AmclNode::isMapObs(int x, int y) {
   if (MAP_VALID(map_, x, y) && map_->cells[MAP_INDEX(map_, x, y)].occ_state == 1) return true;
 
-  int range = 0;
+  int range = rr_serach_range_;
   for (int i = -range; i <= range; i++) {
     for (int j = -range; j <= range; j++) {
       if (i == 0 && j == 0) continue;
